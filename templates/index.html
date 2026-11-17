@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nodify Agents Flow</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>Nodify Agents Flow</h1>
+        <p class="subtitle">
+            Sequential AI agent pipelines · model: <code>{{ model }}</code>
+            · sync every {{ sync_interval }}s
+        </p>
+    </header>
+
+    <!-- ============ VIEW: HOME (configs list) ============ -->
+    <section id="view-home" class="view">
+        <section class="run-form">
+            <form id="addForm">
+                <input type="text" id="newCode" placeholder="JSON-DEV-1794941037653"
+                       autocomplete="off" required>
+                <button type="submit">Add &amp; sync</button>
+            </form>
+            <p class="hint">
+                Enter a <strong>content code</strong>. Its Nodify
+                <code>description</code> will be used as display name.
+            </p>
+        </section>
+
+        <section class="configs">
+            <div class="jobs-header">
+                <h2>Configurations</h2>
+                <div>
+                    <button id="syncAllBtn" class="btn-secondary">Sync all</button>
+                    <button id="refreshConfigsBtn" class="btn-secondary">Refresh</button>
+                </div>
+            </div>
+            <div id="configsList" class="configs-list">
+                <p class="empty">No configurations yet.</p>
+            </div>
+        </section>
+    </section>
+
+    <!-- ============ VIEW: CONFIG (runs of one config) ============ -->
+    <section id="view-config" class="view hidden">
+        <a href="#/" class="back-link">← Back to configurations</a>
+        <div class="config-header">
+            <div>
+                <h2 id="configTitle">—</h2>
+                <p class="detail-meta" id="configMeta"></p>
+            </div>
+            <div>
+                <button id="runConfigBtn" class="btn-primary">Run</button>
+                <button id="syncConfigBtn" class="btn-secondary">Sync</button>
+                <button id="deleteConfigBtn" class="btn-danger">Delete</button>
+            </div>
+        </div>
+        <h3>Runs</h3>
+        <div id="configRunsList" class="runs-list">
+            <p class="empty">No runs yet.</p>
+        </div>
+    </section>
+
+    <!-- ============ VIEW: RUN (details of one run) ============ -->
+    <section id="view-run" class="view hidden">
+        <a href="#/" id="runBackLink" class="back-link">← Back</a>
+        <div class="detail-header">
+            <h2 id="runTitle">—</h2>
+            <button id="deleteRunBtn" class="btn-danger">Delete</button>
+        </div>
+        <p class="detail-meta" id="runMeta"></p>
+        <div id="runError"></div>
+        <div id="runFlow"></div>
+        <div id="runSteps" class="step-cards"></div>
+    </section>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
