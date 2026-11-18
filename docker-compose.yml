@@ -1,23 +1,38 @@
 services:
   ollama:
     image: ollama/ollama:latest
+    container_name: ollama
+    profiles: ["local-ollama"]
     ports:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+      - ./entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    environment:
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:0.5b}
+    init: true
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
 
   runner:
     build: .
+    container_name: runner
     ports:
       - "${RUNNER_PORT:-5700}:5000"
     environment:
       - NODIFY_API_URL=${NODIFY_API_URL}
-      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:0.5b}
-      - SAVE_TO_NODIFY=${SAVE_TO_NODIFY:-true}
-    depends_on:
-      - ollama
+      - SYNC_INTERVAL_SECONDS=${SYNC_INTERVAL_SECONDS:-30}
+      - DB_PATH=/app/data/agentflow.db
+    volumes:
+      - ./data:/app/data
     restart: unless-stopped
 
 volumes:

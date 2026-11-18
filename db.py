@@ -1,8 +1,13 @@
-"""SQLite storage for configs and runs."""
+"""SQLite storage for configs and datas.
+
+Run history lives in `datas` as `run_summary_*` entries. The legacy
+`runs` table has been dropped — datas are the single source of truth.
+"""
 import json
 import os
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timezone
 
 DB_PATH = os.environ.get('DB_PATH', 'data/agentflow.db')
@@ -24,6 +29,7 @@ def _connect():
 
 
 def init():
+    """Create schema and drop the legacy `runs` table (now redundant)."""
     with _lock, _connect() as conn:
         conn.executescript('''
             CREATE TABLE IF NOT EXISTS configs (
@@ -38,20 +44,6 @@ def init():
                 last_run_at TEXT,
                 last_run_status TEXT
             );
-            CREATE TABLE IF NOT EXISTS runs (
-                job_id TEXT PRIMARY KEY,
-                content_code TEXT NOT NULL,
-                description TEXT,
-                status TEXT NOT NULL,
-                started TEXT NOT NULL,
-                finished TEXT,
-                error TEXT,
-                traceback TEXT,
-                config_json TEXT,
-                steps_json TEXT,
-                result_json TEXT,
-                initial_state_json TEXT
-            );
             CREATE TABLE IF NOT EXISTS datas (
                 id TEXT PRIMARY KEY,
                 content_code TEXT NOT NULL,
@@ -63,12 +55,15 @@ def init():
                 modificationDate INTEGER,
                 FOREIGN KEY(content_code) REFERENCES configs(content_code) ON DELETE CASCADE
             );
-            CREATE INDEX IF NOT EXISTS idx_runs_content ON runs(content_code);
-            CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started DESC);
             CREATE INDEX IF NOT EXISTS idx_datas_content ON datas(content_code);
+            CREATE INDEX IF NOT EXISTS idx_datas_key ON datas(content_code, key);
         ''')
+        conn.execute('DROP TABLE IF EXISTS runs')
 
 
+# ---------------------------------------------------------------------------
+# Configs
+# ---------------------------------------------------------------------------
 def _config_row(row):
     if not row:
         return None
@@ -77,21 +72,6 @@ def _config_row(row):
     del d['config_json']
     return d
 
-
-def _run_row(row):
-    if not row:
-        return None
-    d = dict(row)
-    for k in ('config_json', 'steps_json', 'result_json', 'initial_state_json'):
-        try:
-            d[k.replace('_json', '')] = json.loads(d[k]) if d.get(k) else None
-        except json.JSONDecodeError:
-            d[k.replace('_json', '')] = None
-        del d[k]
-    return d
-
-
-# --- Configs ---
 
 def upsert_config(content_code, description, name, config):
     with _lock, _connect() as conn:
@@ -140,152 +120,71 @@ def list_config_codes():
 
 def delete_config(content_code):
     with _lock, _connect() as conn:
-        conn.execute('DELETE FROM runs WHERE content_code = ?', (content_code,))
         conn.execute('DELETE FROM datas WHERE content_code = ?', (content_code,))
         conn.execute('DELETE FROM configs WHERE content_code = ?', (content_code,))
 
 
-def bump_stats(content_code, status, when):
-    with _lock, _connect() as conn:
-        if status == 'done':
-            conn.execute('''
-                UPDATE configs SET success_count = success_count + 1,
-                                   last_run_at = ?, last_run_status = ?
-                WHERE content_code = ?
-            ''', (when, status, content_code))
-        elif status == 'failed':
-            conn.execute('''
-                UPDATE configs SET failure_count = failure_count + 1,
-                                   last_run_at = ?, last_run_status = ?
-                WHERE content_code = ?
-            ''', (when, status, content_code))
-
-
-# --- Datas ---
-
-def upsert_data_entries(content_code, datas):
+# ---------------------------------------------------------------------------
+# Datas
+# ---------------------------------------------------------------------------
+def upsert_data_entries(content_code, datas) -> int:
+    """Replace all local datas for a content. Returns inserted row count."""
+    if datas is None or not isinstance(datas, list):
+        return 0
     if not datas:
-        return
+        return 0
+
+    inserted = 0
     with _lock, _connect() as conn:
         conn.execute('DELETE FROM datas WHERE content_code = ?', (content_code,))
+        seen_ids = set()
         for d in datas:
             if not isinstance(d, dict):
                 continue
             val = d.get('value')
             if isinstance(val, (dict, list)):
                 val = json.dumps(val, ensure_ascii=False)
-            
+            data_id = d.get('id') or str(uuid.uuid4())
+            # Defensive: never crash on buggy upstream payloads with duplicate ids.
+            while data_id in seen_ids:
+                data_id = str(uuid.uuid4())
+            seen_ids.add(data_id)
+            key = d.get('key') or d.get('name') or data_id
             conn.execute('''
-                INSERT INTO datas (id, content_code, key, value, name, data_type, creationDate, modificationDate)
+                INSERT INTO datas (id, content_code, key, value, name, data_type,
+                                   creationDate, modificationDate)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                d.get('id'),
-                content_code,
-                d.get('key'),
-                val,
-                d.get('name'),
-                d.get('dataType'),
-                d.get('creationDate'),
-                d.get('modificationDate'),
+                data_id, content_code, key, val,
+                d.get('name'), d.get('dataType') or d.get('data_type'),
+                d.get('creationDate'), d.get('modificationDate'),
             ))
+            inserted += 1
+    print(f"[db] upsert_data_entries: {inserted} rows for {content_code}")
+    return inserted
 
-
-def list_datas(content_code):
-    with _lock, _connect() as conn:
-        rows = conn.execute('SELECT * FROM datas WHERE content_code = ?', (content_code,)).fetchall()
-        return [dict(r) for r in rows]
-
-
-# --- Runs ---
-
-def create_run(job_id, content_code, description, config, initial_state):
-    with _lock, _connect() as conn:
-        conn.execute('''
-            INSERT INTO runs (job_id, content_code, description, status, started,
-                              config_json, initial_state_json)
-            VALUES (?, ?, ?, 'running', ?, ?, ?)
-        ''', (
-            job_id, content_code, description, _now(),
-            json.dumps(config, ensure_ascii=False),
-            json.dumps(initial_state, ensure_ascii=False),
-        ))
-
-
-def update_run_steps(job_id, steps):
-    with _lock, _connect() as conn:
-        conn.execute(
-            'UPDATE runs SET steps_json = ? WHERE job_id = ?',
-            (json.dumps(steps, ensure_ascii=False), job_id),
-        )
-
-
-def finish_run(job_id, status, steps, result, error=None, traceback_=None):
-    with _lock, _connect() as conn:
-        conn.execute('''
-            UPDATE runs SET status = ?, finished = ?,
-                            steps_json = ?, result_json = ?,
-                            error = ?, traceback = ?
-            WHERE job_id = ?
-        ''', (
-            status, _now(),
-            json.dumps(steps, ensure_ascii=False),
-            json.dumps(result, ensure_ascii=False) if result is not None else None,
-            error, traceback_,
-            job_id,
-        ))
-
-
-def get_run(job_id):
-    with _lock, _connect() as conn:
-        row = conn.execute('SELECT * FROM runs WHERE job_id = ?', (job_id,)).fetchone()
-        return _run_row(row)
-
-
-def list_runs(content_code=None, limit=100):
-    with _lock, _connect() as conn:
-        if content_code:
-            rows = conn.execute('''
-                SELECT * FROM runs WHERE content_code = ?
-                ORDER BY started DESC LIMIT ?
-            ''', (content_code, limit)).fetchall()
-        else:
-            rows = conn.execute('''
-                SELECT * FROM runs ORDER BY started DESC LIMIT ?
-            ''', (limit,)).fetchall()
-        return [_run_row(r) for r in rows]
-
-
-def delete_run(job_id):
-    with _lock, _connect() as conn:
-        conn.execute('DELETE FROM runs WHERE job_id = ?', (job_id,))
-
-
-def recover_abandoned_runs():
-    """Mark runs still 'running'/'queued' (from a previous crash) as failed."""
-    with _lock, _connect() as conn:
-        rows = conn.execute(
-            "SELECT job_id, content_code FROM runs WHERE status IN ('queued', 'running')"
-        ).fetchall()
-        if not rows:
-            return
-        conn.execute('''
-            UPDATE runs SET status = 'failed', finished = ?,
-                            error = 'abandoned (server restart)'
-            WHERE status IN ('queued', 'running')
-        ''', (_now(),))
-        for row in rows:
-            conn.execute('''
-                UPDATE configs SET failure_count = failure_count + 1,
-                                   last_run_at = ?, last_run_status = 'failed'
-                WHERE content_code = ?
-            ''', (_now(), row['content_code']))
 
 def get_datas_for_content(content_code):
-    with _connect() as conn:
+    with _lock, _connect() as conn:
         rows = conn.execute('''
             SELECT id, content_code, key, value, name, data_type, creationDate, modificationDate
-            FROM datas
-            WHERE content_code = ?
+            FROM datas WHERE content_code = ?
+            ORDER BY COALESCE(modificationDate, creationDate, 0) DESC
         ''', (content_code,)).fetchall()
-        
         return [dict(row) for row in rows]
+
+
+def find_data_by_key(key):
+    """Look up a single data row by its key (used as run identifier fallback)."""
+    with _lock, _connect() as conn:
+        row = conn.execute(
+            'SELECT * FROM datas WHERE key = ? LIMIT 1', (key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def count_datas(content_code) -> int:
+    with _lock, _connect() as conn:
+        row = conn.execute('SELECT COUNT(*) AS c FROM datas WHERE content_code = ?',
+                           (content_code,)).fetchone()
+        return row['c'] if row else 0

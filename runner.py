@@ -1,22 +1,12 @@
 """
-Nodify Agents Flow
-==================
+Nodify Agents Flow — sequential pipeline runner.
 
-Sequential pipeline runner for AI agents, backed by Nodify.
-
-The user enters a Nodify CONTENT code (e.g. JSON-DEV-1794941037653).
-The runner fetches that content's payload from Nodify and caches it in a
-local SQLite DB (description, config JSON, stats). Pipelines are executed
-from the cached config and every run is stored in the DB.
-
-The display name of a config is the Nodify content `description` field.
-
-Sync:
-    - At startup, all known configs are re-synced from Nodify.
-    - A background thread re-syncs every SYNC_INTERVAL_SECONDS (default 600).
+The legacy `runs` table has been removed: run history lives only in
+`datas` as `run_summary_*` entries, published to Nodify and fetched
+back on sync. Datas are the single source of truth.
 
 Environment:
-    NODIFY_API_URL           Nodify API base URL
+    NODIFY_API_URL           Nodify API base URL (required)
     OLLAMA_HOST              Ollama HTTP host
     OLLAMA_MODEL             Model name
     DB_PATH                  SQLite file path
@@ -30,7 +20,7 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, render_template, request
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -58,7 +48,11 @@ SYNC_INTERVAL = int(os.environ.get('SYNC_INTERVAL_SECONDS', '600'))
 
 nodify = NodifyClient(NODIFY_API_URL)
 db.init()
-db.recover_abandoned_runs()
+
+# In-memory job registry (lost on restart by design — datas are the
+# single source of truth for persisted run history).
+_jobs = {}
+_jobs_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +69,7 @@ def sanitize_key_part(s):
 def parse_pipeline_config(payload):
     if payload is None:
         raise ValueError("content has no payload")
-    if isinstance(payload, dict):
-        config = payload
-    elif isinstance(payload, str):
-        config = json.loads(payload)
-    else:
-        raise ValueError("payload must be a JSON object or string")
-
+    config = payload if isinstance(payload, dict) else json.loads(payload)
     steps = config.get('steps')
     if not isinstance(steps, list) or not steps:
         raise ValueError("config.steps must be a non-empty list")
@@ -114,6 +102,79 @@ def render_context(template, state):
 
 
 # ---------------------------------------------------------------------------
+# Run-summary helpers (datas ⇄ runs)
+# ---------------------------------------------------------------------------
+def _parse_summary_value(raw):
+    """A run_summary `value` may be a dict or a JSON string; parse defensively."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+
+def _normalize_run_summary(data):
+    """Convert a `run_summary_*` datas row into the run shape the UI expects."""
+    summary = _parse_summary_value(data.get('value'))
+    started = summary.get('creationDate')
+    duration = summary.get('durationSeconds') or 0
+    finished = None
+    if started and duration:
+        try:
+            dt = datetime.fromisoformat(started.replace('Z', '+00:00'))
+            finished = (dt + timedelta(seconds=float(duration))).isoformat()
+        except Exception:
+            finished = None
+
+    status = summary.get('status') or 'unknown'
+    ui_status = 'done' if status == 'success' else status
+
+    return {
+        'job_id': data.get('key') or data.get('id'),
+        'content_code': data.get('content_code'),
+        'description': data.get('name') or data.get('key'),
+        'status': ui_status,
+        'started': started,
+        'finished': finished,
+        'duration': duration,
+        'error': summary.get('error'),
+        'steps': summary.get('steps') or [],
+    }
+
+
+def _compute_run_stats(content_code):
+    """Derive ✓/✗ counts and last-run info from persisted run_summary datas."""
+    datas = db.get_datas_for_content(content_code)
+    success = failure = 0
+    last_run_at = None
+    last_run_status = None
+
+    for d in datas:
+        if not (d.get('key') or '').startswith('run_summary_'):
+            continue
+        summary = _parse_summary_value(d.get('value'))
+        status = summary.get('status')
+        if status == 'success':
+            success += 1
+        elif status == 'failed':
+            failure += 1
+        started = summary.get('creationDate')
+        if started and (last_run_at is None or started > last_run_at):
+            last_run_at = started
+            last_run_status = 'done' if status == 'success' else status
+
+    return {
+        'success_count': success,
+        'failure_count': failure,
+        'last_run_at': last_run_at,
+        'last_run_status': last_run_status,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
 def sync_one(content_code):
@@ -121,23 +182,26 @@ def sync_one(content_code):
     try:
         content = nodify.get_content_by_code(content_code)
         if not content:
-            print(f"[sync] Error: content not found for code {content_code}")
             db.set_sync_error(content_code, "content not found")
             return False
-        
+
         config = parse_pipeline_config(content.get('payload'))
         description = (
             (content.get('description') or '').strip()
-            or config.get('name')
-            or content_code
+            or config.get('name') or content_code
         )
         name = config.get('name') or description
         db.upsert_config(content_code, description, name, config)
 
-        datas = nodify.get_datas_by_content(content_code)
-        print(f"[sync] Upserting {len(datas)} data entries for {content_code}")
-        db.upsert_data_entries(content_code, datas)
+        try:
+            datas = nodify.get_datas_by_content(content_code)
+        except Exception as e:
+            db.set_sync_error(content_code, f"get datas failed: {e}")
+            return False
 
+        db.upsert_data_entries(content_code, datas)
+        db.set_sync_error(content_code, None)
+        print(f"[sync] {content_code}: OK, {len(datas)} datas")
         return True
     except Exception as e:
         print(f"[sync] Exception during sync_one for {content_code}: {e}")
@@ -160,7 +224,7 @@ def background_sync_loop():
     while True:
         try:
             time.sleep(SYNC_INTERVAL)
-            print(f"[sync] background sync starting")
+            print("[sync] background sync starting")
             ok, err = sync_all()
             print(f"[sync] done: {ok} ok, {err} errors")
         except Exception as e:
@@ -171,31 +235,26 @@ def background_sync_loop():
 # Pipeline execution
 # ---------------------------------------------------------------------------
 def run_pipeline(job_id):
-    """Execute pipeline and log a concise summary to Nodify datas."""
-    run = db.get_run(job_id)
-    if not run:
+    """Execute a pipeline and publish a summary to Nodify datas."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
         return
-    config = run['config']
+
+    config = job['config']
     steps_cfg = config['steps']
-    state = dict(run['initial_state'] or {})
-    
+    state = dict(job['initial_state'] or {})
+    steps_state = job['steps']
     start_time = time.time()
-    steps_state = [
-        {'name': s['name'], 'status': 'pending', 'duration': 0, 'message': 'Pending'}
-        for s in steps_cfg
-    ]
-    db.update_run_steps(job_id, steps_state)
 
     try:
         for i, step_cfg in enumerate(steps_cfg):
             step_start = time.time()
             steps_state[i]['status'] = 'running'
             steps_state[i]['message'] = 'Running step'
-            db.update_run_steps(job_id, steps_state)
-            
+
             try:
                 safe_name = sanitize_key_part(step_cfg['name'])
-
                 if step_cfg.get('script_before'):
                     state = exec_before(step_cfg['script_before'], state)
 
@@ -207,63 +266,84 @@ def run_pipeline(job_id):
                 else:
                     state[f'output_{safe_name}'] = output
 
-                step_duration = round(time.time() - step_start, 2)
                 steps_state[i]['status'] = 'done'
-                steps_state[i]['duration'] = step_duration
+                steps_state[i]['duration'] = round(time.time() - step_start, 2)
                 steps_state[i]['message'] = 'Success'
-                db.update_run_steps(job_id, steps_state)
-
             except Exception as e:
-                step_duration = round(time.time() - step_start, 2)
                 steps_state[i]['status'] = 'failed'
-                steps_state[i]['duration'] = step_duration
+                steps_state[i]['duration'] = round(time.time() - step_start, 2)
                 steps_state[i]['message'] = f"Failed: {str(e)}"
-                db.update_run_steps(job_id, steps_state)
                 raise
 
-        total_duration = round(time.time() - start_time, 2)
-        db.finish_run(job_id, 'done', steps_state, state)
-        db.bump_stats(run['content_code'], 'done', run['started'])
+        total = round(time.time() - start_time, 2)
+        with _jobs_lock:
+            job['status'] = 'done'
+            job['finished'] = now_iso()
+            job['result'] = state
 
-        try:
-            content_code = run['content_code']
-            summary_payload = {
-                "status": "success",
-                "creationDate": run['started'],
-                "durationSeconds": total_duration,
-                "steps": [{"name": s["name"], "status": s["status"], "duration": s["duration"], "message": s["message"]} for s in steps_state]
-            }
-            nodify.save_data(content_code, f"run_summary_{job_id[:8]}", summary_payload, name=f"Run {job_id[:8]} Summary", data_type="json")
-            db.upsert_data_entries(content_code, nodify.get_datas_by_content(content_code))
-        except Exception as err:
-            print(f"[nodify] Error saving summary: {err}")
+        _publish_summary(job, steps_state, total, status='success')
 
-    except Exception as e:
-        total_duration = round(time.time() - start_time, 2)
+    except Exception:
+        total = round(time.time() - start_time, 2)
         error_msg = "Connection refused: unable to connect to Ollama service"
-        db.finish_run(job_id, 'failed', steps_state, None, error=error_msg, traceback_=traceback.format_exc())
-        db.bump_stats(run['content_code'], 'failed', run['started'])
+        with _jobs_lock:
+            job['status'] = 'failed'
+            job['finished'] = now_iso()
+            job['error'] = error_msg
 
-        try:
-            content_code = run['content_code']
-            summary_payload = {
-                "status": "failed",
-                "creationDate": run['started'],
-                "durationSeconds": total_duration,
-                "error": error_msg,
-                "steps": [{"name": s["name"], "status": s["status"], "duration": s["duration"], "message": s["message"]} for s in steps_state]
-            }
-            nodify.save_data(content_code, f"run_summary_{job_id[:8]}", summary_payload, name=f"Run {job_id[:8]} Summary", data_type="json")
-            db.upsert_data_entries(content_code, nodify.get_datas_by_content(content_code))
-        except Exception as err:
-            print(f"[nodify] Error saving error summary: {err}")
+        _publish_summary(job, steps_state, total, status='failed', error=error_msg)
+        print(f"[run] {job_id}: failed — {traceback.format_exc()}")
+
+
+def _publish_summary(job, steps_state, duration, status, error=None):
+    """Write the run summary to Nodify, then re-sync it into local datas."""
+    summary = {
+        "status": status,
+        "creationDate": job['started'],
+        "durationSeconds": duration,
+        "steps": [
+            {"name": s["name"], "status": s["status"],
+             "duration": s["duration"], "message": s["message"]}
+            for s in steps_state
+        ],
+    }
+    if error:
+        summary["error"] = error
+
+    key = f"run_summary_{job['job_id'][:8]}"
+    try:
+        ok = nodify.save_data(job['content_code'], key, summary,
+                              name=f"Run {job['job_id'][:8]} Summary",
+                              data_type="json")
+        if ok:
+            sync_one(job['content_code'])
+    except Exception as err:
+        print(f"[nodify] Error saving summary: {err}")
 
 
 def start_job(content_code, cfg):
     job_id = str(uuid.uuid4())
     initial_state = dict(cfg['config'].get('initial_state') or {})
-    db.create_run(job_id, content_code, cfg['description'],
-                  cfg['config'], initial_state)
+    with _jobs_lock:
+        _jobs[job_id] = {
+            'job_id': job_id,
+            'content_code': content_code,
+            'description': cfg['description'],
+            'status': 'running',
+            'started': now_iso(),
+            'finished': None,
+            'error': None,
+            'config': cfg['config'],
+            'initial_state': initial_state,
+            'steps': [
+                {'name': s['name'], 'status': 'pending',
+                 'duration': 0, 'message': 'Pending'}
+                for s in cfg['config']['steps']
+            ],
+            'result': None,
+        }
+    # Honor SYNC_RUN (used by tests and by single-worker deployments
+    # where async runs would race with the request teardown).
     if app.config.get('SYNC_RUN'):
         run_pipeline(job_id)
     else:
@@ -282,7 +362,13 @@ def index():
 
 @app.route('/api/configs', methods=['GET'])
 def api_list_configs():
-    return jsonify({'configs': db.list_configs()})
+    configs = db.list_configs()
+    for c in configs:
+        c.update(_compute_run_stats(c['content_code']))
+        c['datas_count'] = db.count_datas(c['content_code'])
+    configs.sort(key=lambda c: c.get('last_run_at') or c.get('last_synced') or '',
+                 reverse=True)
+    return jsonify({'configs': configs})
 
 
 @app.route('/api/configs', methods=['POST'])
@@ -295,7 +381,9 @@ def api_create_config():
         cfg = db.get_config(code)
         err = cfg.get('last_sync_error') if cfg else 'sync failed'
         return jsonify({'error': err}), 400
-    return jsonify(db.get_config(code)), 201
+    cfg = db.get_config(code)
+    cfg.update(_compute_run_stats(code))
+    return jsonify(cfg), 201
 
 
 @app.route('/api/configs/<content_code>', methods=['GET'])
@@ -303,6 +391,8 @@ def api_get_config(content_code):
     cfg = db.get_config(content_code)
     if not cfg:
         return jsonify({'error': 'not found'}), 404
+    cfg.update(_compute_run_stats(content_code))
+    cfg['datas'] = db.get_datas_for_content(content_code)
     return jsonify(cfg)
 
 
@@ -318,7 +408,9 @@ def api_sync_config(content_code):
         cfg = db.get_config(content_code)
         err = cfg.get('last_sync_error') if cfg else 'sync failed'
         return jsonify({'error': err}), 400
-    return jsonify(db.get_config(content_code))
+    cfg = db.get_config(content_code)
+    cfg.update(_compute_run_stats(content_code))
+    return jsonify(cfg)
 
 
 @app.route('/api/configs/<content_code>/run', methods=['POST'])
@@ -330,9 +422,22 @@ def api_run_config(content_code):
     return jsonify({'job_id': job_id}), 202
 
 
+@app.route('/api/configs/<content_code>/datas', methods=['GET'])
+def api_get_config_datas(content_code):
+    datas = db.get_datas_for_content(content_code)
+    return jsonify({'datas': datas}), 200
+
+
 @app.route('/api/configs/<content_code>/runs', methods=['GET'])
 def api_config_runs(content_code):
-    return jsonify({'runs': db.list_runs(content_code)})
+    """Return run_summary datas, normalized to the shape the UI expects."""
+    datas = db.get_datas_for_content(content_code)
+    runs = [
+        _normalize_run_summary(d)
+        for d in datas
+        if (d.get('key') or '').startswith('run_summary_')
+    ]
+    return jsonify({'runs': runs})
 
 
 @app.route('/api/sync-all', methods=['POST'])
@@ -343,15 +448,23 @@ def api_sync_all():
 
 @app.route('/api/jobs/<job_id>', methods=['GET'])
 def api_get_job(job_id):
-    run = db.get_run(job_id)
-    if not run:
+    """Return an in-memory job if running, else fall back to a persisted
+    run_summary found in datas."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job:
+        return jsonify(job)
+
+    data = db.find_data_by_key(job_id)
+    if not data:
         return jsonify({'error': 'not found'}), 404
-    return jsonify(run)
+    return jsonify(_normalize_run_summary(data))
 
 
 @app.route('/api/jobs/<job_id>', methods=['DELETE'])
 def api_delete_job(job_id):
-    db.delete_run(job_id)
+    with _jobs_lock:
+        _jobs.pop(job_id, None)
     return jsonify({'status': 'ok'})
 
 
@@ -360,18 +473,18 @@ def api_health():
     return jsonify({'status': 'ok', 'model': OLLAMA_MODEL})
 
 
-@app.route('/api/configs/<content_code>/datas', methods=['GET'])
-def api_get_config_datas(content_code):
-    datas = db.get_datas_for_content(content_code)
-    return jsonify({'datas': datas}), 200
-    
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
-    threading.Thread(target=lambda: (print("[sync] startup sync starting"),
-                                     print(f"[sync] startup done: {sync_all()}")),
-                     daemon=True).start()
+    print(f"[startup] DB_PATH = {os.path.abspath(db.DB_PATH)}")
+    print(f"[startup] NODIFY_API_URL = {NODIFY_API_URL}")
+
+    def _startup_sync():
+        print("[sync] startup sync starting")
+        print(f"[sync] startup done: {sync_all()}")
+
+    threading.Thread(target=_startup_sync, daemon=True).start()
     threading.Thread(target=background_sync_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=port)
