@@ -18,5 +18,5 @@ def chat(model: str, prompt: str, host: str = 'http://localhost:11434', timeout:
             result = json.loads(raw)
             return result.get('response', '').strip()
     except Exception as e:
-        print(f"[llm] chat error: {e}")
+        print(f"[llm] chat error: {e}", flush=True)
         raise

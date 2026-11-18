@@ -1,17 +1,5 @@
 """
 Nodify Agents Flow — sequential pipeline runner.
-
-The legacy `runs` table has been removed: run history lives only in
-`datas` as `run_summary_*` entries, published to Nodify and fetched
-back on sync. Datas are the single source of truth.
-
-Environment:
-    NODIFY_API_URL           Nodify API base URL (required)
-    OLLAMA_HOST              Ollama HTTP host
-    OLLAMA_MODEL             Model name
-    DB_PATH                  SQLite file path
-    SYNC_INTERVAL_SECONDS    Background sync interval (default 600)
-    PORT                     HTTP port (default 5000)
 """
 import json
 import os
@@ -36,11 +24,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_prefix=1)
 
 NODIFY_API_URL = os.environ.get('NODIFY_API_URL', '')
 if not NODIFY_API_URL:
-    raise SystemExit(
-        "NODIFY_API_URL is not set. "
-        "Export it before starting the runner, e.g. "
-        "`export NODIFY_API_URL=https://nodify-api.azirar.ovh`"
-    )
+    raise SystemExit("NODIFY_API_URL is not set.")
 
 OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'qwen2.5:0.5b')
@@ -49,8 +33,6 @@ SYNC_INTERVAL = int(os.environ.get('SYNC_INTERVAL_SECONDS', '600'))
 nodify = NodifyClient(NODIFY_API_URL)
 db.init()
 
-# In-memory job registry (lost on restart by design — datas are the
-# single source of truth for persisted run history).
 _jobs = {}
 _jobs_lock = threading.Lock()
 
@@ -78,13 +60,10 @@ def parse_pipeline_config(payload):
             raise ValueError(f"steps[{i}] must be an object")
         if not step.get('name'):
             raise ValueError(f"steps[{i}].name is required")
-        if 'context' not in step:
-            raise ValueError(f"steps[{i}].context is required")
     return config
 
 
 PLACEHOLDER_RE = re.compile(r'\{\{\s*state\.([a-zA-Z0-9_.]+)\s*\}\}')
-
 
 def render_context(template, state):
     def repl(match):
@@ -102,10 +81,9 @@ def render_context(template, state):
 
 
 # ---------------------------------------------------------------------------
-# Run-summary helpers (datas ⇄ runs)
+# Run-summary helpers
 # ---------------------------------------------------------------------------
 def _parse_summary_value(raw):
-    """A run_summary `value` may be a dict or a JSON string; parse defensively."""
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
@@ -117,7 +95,6 @@ def _parse_summary_value(raw):
 
 
 def _normalize_run_summary(data):
-    """Convert a `run_summary_*` datas row into the run shape the UI expects."""
     summary = _parse_summary_value(data.get('value'))
     started = summary.get('creationDate')
     duration = summary.get('durationSeconds') or 0
@@ -146,7 +123,6 @@ def _normalize_run_summary(data):
 
 
 def _compute_run_stats(content_code):
-    """Derive ✓/✗ counts and last-run info from persisted run_summary datas."""
     datas = db.get_datas_for_content(content_code)
     success = failure = 0
     last_run_at = None
@@ -178,7 +154,6 @@ def _compute_run_stats(content_code):
 # Sync
 # ---------------------------------------------------------------------------
 def sync_one(content_code):
-    """Re-fetch a content from Nodify and update the cached config & datas."""
     try:
         content = nodify.get_content_by_code(content_code)
         if not content:
@@ -186,10 +161,7 @@ def sync_one(content_code):
             return False
 
         config = parse_pipeline_config(content.get('payload'))
-        description = (
-            (content.get('description') or '').strip()
-            or config.get('name') or content_code
-        )
+        description = ((content.get('description') or '').strip() or config.get('name') or content_code)
         name = config.get('name') or description
         db.upsert_config(content_code, description, name, config)
 
@@ -201,10 +173,10 @@ def sync_one(content_code):
 
         db.upsert_data_entries(content_code, datas)
         db.set_sync_error(content_code, None)
-        print(f"[sync] {content_code}: OK, {len(datas)} datas")
+        print(f"[sync] {content_code}: OK, {len(datas)} datas", flush=True)
         return True
     except Exception as e:
-        print(f"[sync] Exception during sync_one for {content_code}: {e}")
+        print(f"[sync] Exception during sync_one for {content_code}: {e}", flush=True)
         db.set_sync_error(content_code, str(e))
         return False
 
@@ -224,18 +196,17 @@ def background_sync_loop():
     while True:
         try:
             time.sleep(SYNC_INTERVAL)
-            print("[sync] background sync starting")
+            print("[sync] background sync starting", flush=True)
             ok, err = sync_all()
-            print(f"[sync] done: {ok} ok, {err} errors")
+            print(f"[sync] done: {ok} ok, {err} errors", flush=True)
         except Exception as e:
-            print(f"[sync] error: {e}")
+            print(f"[sync] error: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
 # Pipeline execution
 # ---------------------------------------------------------------------------
 def run_pipeline(job_id):
-    """Execute a pipeline and publish a summary to Nodify datas."""
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job:
@@ -248,31 +219,49 @@ def run_pipeline(job_id):
     start_time = time.time()
 
     try:
-        for i, step_cfg in enumerate(steps_cfg):
+        for step_cfg, step_state in zip(steps_cfg, steps_state):
             step_start = time.time()
-            steps_state[i]['status'] = 'running'
-            steps_state[i]['message'] = 'Running step'
+            step_state['status'] = 'running'
+            step_state['message'] = 'Running step'
 
             try:
                 safe_name = sanitize_key_part(step_cfg['name'])
+
+                # 1. Script Before
                 if step_cfg.get('script_before'):
-                    state = exec_before(step_cfg['script_before'], state)
+                    state = exec_before(
+                        step_cfg['script_before'], 
+                        state, 
+                        OLLAMA_MODEL, 
+                        OLLAMA_HOST
+                    )
 
+                # 2. LLM Call (only if context is not empty)
                 prompt = render_context(step_cfg.get('context', ''), state)
-                output = llm.chat(OLLAMA_MODEL, prompt, host=OLLAMA_HOST)
+                if prompt.strip():
+                    output = llm.chat(OLLAMA_MODEL, prompt, host=OLLAMA_HOST)
+                else:
+                    output = ""
 
+                # 3. Script After
                 if step_cfg.get('script_after'):
-                    state = exec_after(step_cfg['script_after'], state, output)
+                    state = exec_after(
+                        step_cfg['script_after'], 
+                        state, 
+                        output, 
+                        OLLAMA_MODEL, 
+                        OLLAMA_HOST
+                    )
                 else:
                     state[f'output_{safe_name}'] = output
 
-                steps_state[i]['status'] = 'done'
-                steps_state[i]['duration'] = round(time.time() - step_start, 2)
-                steps_state[i]['message'] = 'Success'
+                step_state['status'] = 'done'
+                step_state['duration'] = round(time.time() - step_start, 2)
+                step_state['message'] = 'Success'
             except Exception as e:
-                steps_state[i]['status'] = 'failed'
-                steps_state[i]['duration'] = round(time.time() - step_start, 2)
-                steps_state[i]['message'] = f"Failed: {str(e)}"
+                step_state['status'] = 'failed'
+                step_state['duration'] = round(time.time() - step_start, 2)
+                step_state['message'] = f"Failed: {str(e)}"
                 raise
 
         total = round(time.time() - start_time, 2)
@@ -283,20 +272,19 @@ def run_pipeline(job_id):
 
         _publish_summary(job, steps_state, total, status='success')
 
-    except Exception:
+    except Exception as e:
         total = round(time.time() - start_time, 2)
-        error_msg = "Connection refused: unable to connect to Ollama service"
+        error_msg = f"Run failed: {str(e)}"
+        print(f"[run] {job_id}: failed — {traceback.format_exc()}", flush=True)
         with _jobs_lock:
             job['status'] = 'failed'
             job['finished'] = now_iso()
             job['error'] = error_msg
 
         _publish_summary(job, steps_state, total, status='failed', error=error_msg)
-        print(f"[run] {job_id}: failed — {traceback.format_exc()}")
 
 
 def _publish_summary(job, steps_state, duration, status, error=None):
-    """Write the run summary to Nodify, then re-sync it into local datas."""
     summary = {
         "status": status,
         "creationDate": job['started'],
@@ -318,7 +306,7 @@ def _publish_summary(job, steps_state, duration, status, error=None):
         if ok:
             sync_one(job['content_code'])
     except Exception as err:
-        print(f"[nodify] Error saving summary: {err}")
+        print(f"[nodify] Error saving summary: {err}", flush=True)
 
 
 def start_job(content_code, cfg):
@@ -342,8 +330,6 @@ def start_job(content_code, cfg):
             ],
             'result': None,
         }
-    # Honor SYNC_RUN (used by tests and by single-worker deployments
-    # where async runs would race with the request teardown).
     if app.config.get('SYNC_RUN'):
         run_pipeline(job_id)
     else:
@@ -356,9 +342,7 @@ def start_job(content_code, cfg):
 # ---------------------------------------------------------------------------
 @app.route('/')
 def index():
-    return render_template('index.html', model=OLLAMA_MODEL,
-                           sync_interval=SYNC_INTERVAL)
-
+    return render_template('index.html', model=OLLAMA_MODEL, sync_interval=SYNC_INTERVAL)
 
 @app.route('/api/configs', methods=['GET'])
 def api_list_configs():
@@ -366,10 +350,8 @@ def api_list_configs():
     for c in configs:
         c.update(_compute_run_stats(c['content_code']))
         c['datas_count'] = db.count_datas(c['content_code'])
-    configs.sort(key=lambda c: c.get('last_run_at') or c.get('last_synced') or '',
-                 reverse=True)
+    configs.sort(key=lambda c: c.get('last_run_at') or c.get('last_synced') or '', reverse=True)
     return jsonify({'configs': configs})
-
 
 @app.route('/api/configs', methods=['POST'])
 def api_create_config():
@@ -385,7 +367,6 @@ def api_create_config():
     cfg.update(_compute_run_stats(code))
     return jsonify(cfg), 201
 
-
 @app.route('/api/configs/<content_code>', methods=['GET'])
 def api_get_config(content_code):
     cfg = db.get_config(content_code)
@@ -395,12 +376,10 @@ def api_get_config(content_code):
     cfg['datas'] = db.get_datas_for_content(content_code)
     return jsonify(cfg)
 
-
 @app.route('/api/configs/<content_code>', methods=['DELETE'])
 def api_delete_config(content_code):
     db.delete_config(content_code)
     return jsonify({'status': 'ok'})
-
 
 @app.route('/api/configs/<content_code>/sync', methods=['POST'])
 def api_sync_config(content_code):
@@ -412,7 +391,6 @@ def api_sync_config(content_code):
     cfg.update(_compute_run_stats(content_code))
     return jsonify(cfg)
 
-
 @app.route('/api/configs/<content_code>/run', methods=['POST'])
 def api_run_config(content_code):
     cfg = db.get_config(content_code)
@@ -421,45 +399,32 @@ def api_run_config(content_code):
     job_id = start_job(content_code, cfg)
     return jsonify({'job_id': job_id}), 202
 
-
 @app.route('/api/configs/<content_code>/datas', methods=['GET'])
 def api_get_config_datas(content_code):
     datas = db.get_datas_for_content(content_code)
     return jsonify({'datas': datas}), 200
 
-
 @app.route('/api/configs/<content_code>/runs', methods=['GET'])
 def api_config_runs(content_code):
-    """Return run_summary datas, normalized to the shape the UI expects."""
     datas = db.get_datas_for_content(content_code)
-    runs = [
-        _normalize_run_summary(d)
-        for d in datas
-        if (d.get('key') or '').startswith('run_summary_')
-    ]
+    runs = [_normalize_run_summary(d) for d in datas if (d.get('key') or '').startswith('run_summary_')]
     return jsonify({'runs': runs})
-
 
 @app.route('/api/sync-all', methods=['POST'])
 def api_sync_all():
     ok, err = sync_all()
     return jsonify({'ok': ok, 'errors': err})
 
-
 @app.route('/api/jobs/<job_id>', methods=['GET'])
 def api_get_job(job_id):
-    """Return an in-memory job if running, else fall back to a persisted
-    run_summary found in datas."""
     with _jobs_lock:
         job = _jobs.get(job_id)
     if job:
         return jsonify(job)
-
     data = db.find_data_by_key(job_id)
     if not data:
         return jsonify({'error': 'not found'}), 404
     return jsonify(_normalize_run_summary(data))
-
 
 @app.route('/api/jobs/<job_id>', methods=['DELETE'])
 def api_delete_job(job_id):
@@ -467,23 +432,21 @@ def api_delete_job(job_id):
         _jobs.pop(job_id, None)
     return jsonify({'status': 'ok'})
 
-
 @app.route('/api/health', methods=['GET'])
 def api_health():
     return jsonify({'status': 'ok', 'model': OLLAMA_MODEL})
-
 
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
-    print(f"[startup] DB_PATH = {os.path.abspath(db.DB_PATH)}")
-    print(f"[startup] NODIFY_API_URL = {NODIFY_API_URL}")
+    print(f"[startup] DB_PATH = {os.path.abspath(db.DB_PATH)}", flush=True)
+    print(f"[startup] NODIFY_API_URL = {NODIFY_API_URL}", flush=True)
 
     def _startup_sync():
-        print("[sync] startup sync starting")
-        print(f"[sync] startup done: {sync_all()}")
+        print("[sync] startup sync starting", flush=True)
+        print(f"[sync] startup done: {sync_all()}", flush=True)
 
     threading.Thread(target=_startup_sync, daemon=True).start()
     threading.Thread(target=background_sync_loop, daemon=True).start()

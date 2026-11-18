@@ -1,8 +1,4 @@
-"""SQLite storage for configs and datas.
-
-Run history lives in `datas` as `run_summary_*` entries. The legacy
-`runs` table has been dropped — datas are the single source of truth.
-"""
+"""SQLite storage for configs and datas."""
 import json
 import os
 import sqlite3
@@ -13,10 +9,8 @@ from datetime import datetime, timezone
 DB_PATH = os.environ.get('DB_PATH', 'data/agentflow.db')
 _lock = threading.Lock()
 
-
 def _now():
     return datetime.now(timezone.utc).isoformat()
-
 
 def _connect():
     d = os.path.dirname(DB_PATH)
@@ -27,9 +21,7 @@ def _connect():
     conn.execute('PRAGMA foreign_keys = ON')
     return conn
 
-
 def init():
-    """Create schema and drop the legacy `runs` table (now redundant)."""
     with _lock, _connect() as conn:
         conn.executescript('''
             CREATE TABLE IF NOT EXISTS configs (
@@ -60,10 +52,6 @@ def init():
         ''')
         conn.execute('DROP TABLE IF EXISTS runs')
 
-
-# ---------------------------------------------------------------------------
-# Configs
-# ---------------------------------------------------------------------------
 def _config_row(row):
     if not row:
         return None
@@ -71,7 +59,6 @@ def _config_row(row):
     d['config'] = json.loads(d['config_json']) if d['config_json'] else None
     del d['config_json']
     return d
-
 
 def upsert_config(content_code, description, name, config):
     with _lock, _connect() as conn:
@@ -84,56 +71,35 @@ def upsert_config(content_code, description, name, config):
                 config_json = excluded.config_json,
                 last_synced = excluded.last_synced,
                 last_sync_error = NULL
-        ''', (content_code, description, name,
-              json.dumps(config, ensure_ascii=False), _now()))
-
+        ''', (content_code, description, name, json.dumps(config, ensure_ascii=False), _now()))
 
 def set_sync_error(content_code, error):
     with _lock, _connect() as conn:
-        conn.execute(
-            'UPDATE configs SET last_sync_error = ?, last_synced = ? WHERE content_code = ?',
-            (error, _now(), content_code),
-        )
-
+        conn.execute('UPDATE configs SET last_sync_error = ?, last_synced = ? WHERE content_code = ?',
+                     (error, _now(), content_code))
 
 def get_config(content_code):
     with _lock, _connect() as conn:
-        row = conn.execute('SELECT * FROM configs WHERE content_code = ?',
-                           (content_code,)).fetchone()
+        row = conn.execute('SELECT * FROM configs WHERE content_code = ?', (content_code,)).fetchone()
         return _config_row(row)
-
 
 def list_configs():
     with _lock, _connect() as conn:
-        rows = conn.execute('''
-            SELECT * FROM configs
-            ORDER BY COALESCE(last_run_at, last_synced) DESC
-        ''').fetchall()
+        rows = conn.execute('SELECT * FROM configs ORDER BY COALESCE(last_run_at, last_synced) DESC').fetchall()
         return [_config_row(r) for r in rows]
-
 
 def list_config_codes():
     with _lock, _connect() as conn:
-        return [r['content_code']
-                for r in conn.execute('SELECT content_code FROM configs').fetchall()]
-
+        return [r['content_code'] for r in conn.execute('SELECT content_code FROM configs').fetchall()]
 
 def delete_config(content_code):
     with _lock, _connect() as conn:
         conn.execute('DELETE FROM datas WHERE content_code = ?', (content_code,))
         conn.execute('DELETE FROM configs WHERE content_code = ?', (content_code,))
 
-
-# ---------------------------------------------------------------------------
-# Datas
-# ---------------------------------------------------------------------------
 def upsert_data_entries(content_code, datas) -> int:
-    """Replace all local datas for a content. Returns inserted row count."""
-    if datas is None or not isinstance(datas, list):
+    if datas is None or not isinstance(datas, list) or not datas:
         return 0
-    if not datas:
-        return 0
-
     inserted = 0
     with _lock, _connect() as conn:
         conn.execute('DELETE FROM datas WHERE content_code = ?', (content_code,))
@@ -145,46 +111,33 @@ def upsert_data_entries(content_code, datas) -> int:
             if isinstance(val, (dict, list)):
                 val = json.dumps(val, ensure_ascii=False)
             data_id = d.get('id') or str(uuid.uuid4())
-            # Defensive: never crash on buggy upstream payloads with duplicate ids.
             while data_id in seen_ids:
                 data_id = str(uuid.uuid4())
             seen_ids.add(data_id)
             key = d.get('key') or d.get('name') or data_id
             conn.execute('''
-                INSERT INTO datas (id, content_code, key, value, name, data_type,
-                                   creationDate, modificationDate)
+                INSERT INTO datas (id, content_code, key, value, name, data_type, creationDate, modificationDate)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                data_id, content_code, key, val,
-                d.get('name'), d.get('dataType') or d.get('data_type'),
-                d.get('creationDate'), d.get('modificationDate'),
-            ))
+            ''', (data_id, content_code, key, val, d.get('name'), d.get('dataType') or d.get('data_type'),
+                  d.get('creationDate'), d.get('modificationDate')))
             inserted += 1
-    print(f"[db] upsert_data_entries: {inserted} rows for {content_code}")
+    print(f"[db] upsert_data_entries: {inserted} rows for {content_code}", flush=True)
     return inserted
-
 
 def get_datas_for_content(content_code):
     with _lock, _connect() as conn:
         rows = conn.execute('''
             SELECT id, content_code, key, value, name, data_type, creationDate, modificationDate
-            FROM datas WHERE content_code = ?
-            ORDER BY COALESCE(modificationDate, creationDate, 0) DESC
+            FROM datas WHERE content_code = ? ORDER BY COALESCE(modificationDate, creationDate, 0) DESC
         ''', (content_code,)).fetchall()
         return [dict(row) for row in rows]
 
-
 def find_data_by_key(key):
-    """Look up a single data row by its key (used as run identifier fallback)."""
     with _lock, _connect() as conn:
-        row = conn.execute(
-            'SELECT * FROM datas WHERE key = ? LIMIT 1', (key,)
-        ).fetchone()
+        row = conn.execute('SELECT * FROM datas WHERE key = ? LIMIT 1', (key,)).fetchone()
         return dict(row) if row else None
-
 
 def count_datas(content_code) -> int:
     with _lock, _connect() as conn:
-        row = conn.execute('SELECT COUNT(*) AS c FROM datas WHERE content_code = ?',
-                           (content_code,)).fetchone()
+        row = conn.execute('SELECT COUNT(*) AS c FROM datas WHERE content_code = ?', (content_code,)).fetchone()
         return row['c'] if row else 0
