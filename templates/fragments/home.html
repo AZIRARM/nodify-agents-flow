@@ -1,0 +1,26 @@
+<section id="view-home" class="view">
+    <section class="run-form">
+        <form id="addForm">
+            <input type="text" id="newCode" placeholder="JSON-DEV-1794941037653"
+                   autocomplete="off" required>
+            <button type="submit">Add &amp; sync</button>
+        </form>
+        <p class="hint">
+            Enter a <strong>content code</strong>. Its Nodify
+            <code>description</code> will be used as display name.
+        </p>
+    </section>
+
+    <section class="configs">
+        <div class="jobs-header">
+            <h2>Configurations</h2>
+            <div>
+                <button id="syncAllBtn" class="btn-secondary">Sync all</button>
+                <button id="refreshConfigsBtn" class="btn-secondary">Refresh</button>
+            </div>
+        </div>
+        <div id="configsList" class="configs-list">
+            <p class="empty">No configurations yet.</p>
+        </div>
+    </section>
+</section>
